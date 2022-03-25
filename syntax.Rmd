@@ -1,0 +1,154 @@
+---
+title: Neos analysis (updated)
+output: html_notebook
+---
+
+```{r message=TRUE, warning=TRUE, include=FALSE}
+library("data.table")
+library("ggplot2")
+library("lubridate")
+library("kableExtra")
+library("forecast")
+
+Sys.setlocale("LC_TIME", "C")
+
+# Change working directory
+# setwd("path")
+
+```
+
+# Load data
+
+```{r}
+neos_data <- fread("dades/neos_data.txt", sep = "@", header = T)
+neos_data[, date := as.Date(date)]
+neos_data_selected <- fread("dades/neos_data_selected.txt", sep = "@", header = T)
+neos_data_selected[, date := as.Date(date)]
+data_dx_procedures <- fread("dades/redata_dx_procedures.txt", sep = "@", header = T)
+data_dx_procedures[, date := as.Date(date)]
+```
+
+# Results
+
+```{r}
+# Summary of number of new malignant neoplasms and mothly incidence
+table_0 <- neos_data[, .(
+  `Number of new malignant neoplasms` = sum(Value),
+  `Monthly average incidence` = mean(Rate)
+), .(Variable, Period = ifelse(Year %in% 2014:2018, "2014-2018", ifelse(Year == 2019, "2019", ifelse(Year == 2020, "2020", "2021"))))]
+table_0[order(Variable, Period)]
+```
+
+
+```{r message=FALSE, warning=FALSE}
+#  Observed (Rate column) and estimated (Point Forecast, Lo 95 and Hi 95 columns) rates of monthly new cancer diagnoses
+neos_data_split <- split(neos_data, neos_data$Variable, drop = TRUE)
+neos_predictions <- do.call("rbind", lapply(neos_data_split, 
+                                            function(d){
+                                              dx_ts <- ts(d[order(date)][Year < 2020, Rate], frequency = 12)
+                                              dxfit <- tslm(dx_ts ~ trend + season)
+                                              pred <- forecast(dxfit, h =  length(unique(d[Year > 2019, date])), level = c(95))
+                                              dt_predict <- as.data.table(pred)
+                                              dt_predict[, date :=  seq(d[Year > 2019][, min(date)] , to = d[Year > 2019][, max(date)], by = "month")]
+                                              dt_predict[, Variable := unique(d$Variable)]
+                                              dt_predict_observed <- merge(dt_predict, d[, c("date", "Variable", "Value", "Population", "Rate")], by = c("date", "Variable"))
+                                              dt_predict_observed
+                                              
+                                              }
+                                            )
+                            )
+```
+
+```{r fig.width=6, fig.height=6}
+# Figure 1
+neos_predictions[, Variable := factor(Variable, levels = c("Total", "Women", "Men"))]
+tiff('Figure1.tiff', units="in", width=6, height=6, res=300, compression = 'lzw')
+ggplot(neos_predictions, aes(x = date)) +
+  annotate("rect",
+           xmin = as.Date("2020-03-01"), xmax = as.Date("2020-06-01"),
+           ymin = -Inf, ymax = Inf,  fill = "#E07A5F", alpha=.3)  +
+  annotate("text",
+           x = as.Date("2020-04-15"),
+           y = 10, label = c("", "", "Lockdown"), color = "#343a40", size = 3.5)  +
+  geom_line(aes(y = Rate, linetype = "Observed")) +
+  geom_point(aes(y = Rate)) +
+  geom_line(aes(y = `Point Forecast`, linetype = "Expected")) +
+  geom_ribbon(aes(ymin = `Lo 95`, ymax = `Hi 95`), fill = "grey", alpha = .5) +
+  theme_classic() + labs(x = "Months", y = "Incidence per 100.000 population", linetype = "") +
+  scale_linetype_manual(values = c("Expected" = 2, "Observed" = 1)) +
+  scale_x_date(breaks = "1 month", date_labels = "%Y-%b") +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5),
+        legend.position = "bottom") + ylim(0, NA) + facet_wrap(~ Variable, scales = "free_y", nrow = 3)
+dev.off()
+```
+
+
+```{r}
+# Supplementary material S2
+table_S2 <- neos_predictions[, lapply(.SD, function(x){
+  (Rate - x)/x*100
+  }),
+  .SDcols = c("Point Forecast", "Hi 95", "Lo 95"), c("Variable", "date")]
+table_S2
+```
+
+```{r}
+# Monthly average of new cancer diagnoses comparaison. Pre-pandemic period, 2020 and 2021.
+aux <- rbind(neos_data[Variable == "Total"],
+             neos_data_selected)
+table_1 <- aux[, .(
+  `New cancer diagnoses` = sum(Value),
+  `Monthly average of cancer incidence` = mean(Rate)
+), c("Year", "Variable")][Year %in% c(2019:2021)]
+
+
+table_1_pvalues <- aux[, .(
+  P_value_19_20 = t.test(x = Rate[Year == 2019], y = Rate[Year == 2020])$p.value,
+  P_value_19_21 = t.test(x = Rate[Year == 2019], y = Rate[Year == 2021])$p.value
+), "Variable"]
+
+table_1 <- merge(table_1, table_1_pvalues, by = "Variable")
+table_1[Year == 2019, P_value_19_20 := NA]
+table_1[Year == 2021, P_value_19_20 := P_value_19_21]
+table_1[, P_value_19_21 := NULL]
+
+table_1[, Perc_dif := (`Monthly average of cancer incidence` - `Monthly average of cancer incidence`[Year == 2019])*100/`Monthly average of cancer incidence`[Year == 2019], by = c("Variable")]
+table_1
+```
+
+```{r}
+# Figure 2
+tiff('Figure2.tiff', units="in", width=8, height=6, res=300, compression = 'lzw')
+ggplot(table_1, aes(y = `Monthly average of cancer incidence`, x = Year, fill = factor(ifelse(Year == "2019", "Statistically non-significant",
+                                                                       ifelse(P_value_19_20 > 0.05, "Statistically non-significant", "Statistically significant")), levels = c("Statistically non-significant", "Statistically significant")), label = ifelse(P_value_19_20 < 0.05, "*", ""))) +
+  geom_bar(stat = "Identity") +
+  geom_hline(data = table_1[Year == "2019"], aes(yintercept=`Monthly average of cancer incidence`), colour = "#3D405B") +
+  # geom_bar(data = taula_neos_tot[Variable == "Total"], stat = "Identity") +
+  # geom_hline(data = taula_neos_tot[Variable == "Total" & Year == "2019"], aes(yintercept=`Mitjana de la incidència`), colour = "#3D405B") +
+  # geom_text(vjust = 1) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  scale_fill_manual(values = c("Statistically non-significant" = "#212529", "Statistically significant" = "#adb5bd")) +
+  facet_wrap(~ Variable, scales = "free") +
+  guides(fill = guide_legend(ncol = 2)) +
+  labs(title = "", x = "", y = "Monthly average of cancer incidence", fill = "")
+dev.off()
+```
+
+
+```{r}
+# Correlation during 2020 and 2021 between CRC and colonoscopies and between mammograms and breast cancer
+R_CR <- cor(data_dx_procedures[date > as.Date("2020-01-01") & Variable == "Colonoscopies"]$Rate, neos_data_selected[date > as.Date("2020-01-01") & Variable == "Colorrectal"]$Rate)
+R_mama <- cor(data_dx_procedures[date > as.Date("2020-01-01") & Variable == "Mammographies"]$Rate, neos_data_selected[date > as.Date("2020-01-01") & Variable == "Breast"]$Rate)
+
+```
+
+```{r}
+# Number of diagnostic procedures
+table_procedures <- dcast(data_dx_procedures[, .(
+  `New diagnostic procedures` = sum(Value)
+  ), c("Year", "Variable")
+  ], Year ~ Variable)
+
+
+```
